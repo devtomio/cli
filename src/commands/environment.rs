@@ -1,9 +1,10 @@
 use std::fmt::Display;
 
+use crate::{
+    controllers::project::get_project, errors::RailwayError, interact_or,
+    util::prompt::prompt_options,
+};
 use anyhow::bail;
-use is_terminal::IsTerminal;
-
-use crate::{interact_or, util::prompt::prompt_options};
 
 use super::{queries::project::ProjectProjectEnvironmentsEdgesNode, *};
 
@@ -19,21 +20,18 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
     let client = GQLClient::new_authorized(&configs)?;
     let linked_project = configs.get_linked_project().await?;
 
-    let vars = queries::project::Variables {
-        id: linked_project.project.to_owned(),
-    };
-    let res = post_graphql::<queries::Project, _>(&client, configs.get_backboard(), vars).await?;
-    let body = res
-        .data
-        .context("Failed to get environments (query project)")?;
+    let project = get_project(&client, &configs, linked_project.project.clone()).await?;
 
-    let environments: Vec<_> = body
-        .project
+    if project.deleted_at.is_some() {
+        bail!(RailwayError::ProjectDeleted);
+    }
+
+    let environments = project
         .environments
         .edges
         .iter()
         .map(|env| Environment(&env.node))
-        .collect();
+        .collect::<Vec<_>>();
 
     let environment = match args.environment {
         // If the environment is specified, find it in the list of environments
@@ -62,11 +60,14 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
         }
     };
 
+    let environment_name = environment.0.name.clone();
+    println!("Activated environment {}", environment_name.purple().bold());
+
     configs.link_project(
         linked_project.project.clone(),
         linked_project.name.clone(),
         environment.0.id.clone(),
-        Some(environment.0.name.clone()),
+        Some(environment_name),
     )?;
     configs.write()?;
     Ok(())
@@ -75,7 +76,7 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
 #[derive(Debug, Clone)]
 struct Environment<'a>(&'a ProjectProjectEnvironmentsEdgesNode);
 
-impl<'a> Display for Environment<'a> {
+impl Display for Environment<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.name)
     }

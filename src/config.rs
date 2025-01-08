@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     client::{post_graphql, GQLClient},
     commands::queries,
+    errors::RailwayError,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde_with::skip_serializing_none]
 #[serde(rename_all = "camelCase")]
-pub struct RailwayProject {
+pub struct LinkedProject {
     pub project_path: String,
     pub name: Option<String>,
     pub project: String,
@@ -39,7 +40,7 @@ pub struct RailwayUser {
 #[serde_with::skip_serializing_none]
 #[serde(rename_all = "camelCase")]
 pub struct RailwayConfig {
-    pub projects: BTreeMap<String, RailwayProject>,
+    pub projects: BTreeMap<String, LinkedProject>,
     pub user: RailwayUser,
 }
 
@@ -114,6 +115,22 @@ impl Configs {
         std::env::var("RAILWAY_API_TOKEN").ok()
     }
 
+    pub fn env_is_ci() -> bool {
+        std::env::var("CI")
+            .map(|val| val.trim().to_lowercase() == "true")
+            .unwrap_or(false)
+    }
+
+    /// tries the environment variable and the config file
+    pub fn get_railway_auth_token(&self) -> Option<String> {
+        Self::get_railway_api_token().or(self
+            .root_config
+            .user
+            .token
+            .clone()
+            .filter(|t| !t.is_empty()))
+    }
+
     pub fn get_environment_id() -> Environment {
         match std::env::var("RAILWAY_ENV")
             .map(|env| env.to_lowercase())
@@ -129,9 +146,9 @@ impl Configs {
 
     pub fn get_host(&self) -> &'static str {
         match Self::get_environment_id() {
-            Environment::Production => "railway.app",
-            Environment::Staging => "railway-staging.app",
-            Environment::Dev => "railway-develop.app",
+            Environment::Production => "railway.com",
+            Environment::Staging => "railway-staging.com",
+            Environment::Dev => "railway-develop.com",
         }
     }
 
@@ -151,7 +168,9 @@ impl Configs {
         if Self::get_railway_token().is_some() {
             return self.get_current_directory();
         }
+
         let mut current_path = std::env::current_dir()?;
+
         loop {
             let path = current_path
                 .to_str()
@@ -165,46 +184,43 @@ impl Configs {
                 break;
             }
         }
-        Err(anyhow::anyhow!("No linked project found"))
+
+        Err(RailwayError::NoLinkedProject.into())
     }
 
-    pub async fn get_linked_project(&self) -> Result<RailwayProject> {
+    pub async fn get_linked_project(&self) -> Result<LinkedProject> {
+        let path = self.get_closest_linked_project_directory()?;
+        let project = self.root_config.projects.get(&path);
+
         if Self::get_railway_token().is_some() {
             let vars = queries::project_token::Variables {};
             let client = GQLClient::new_authorized(self)?;
 
-            let res = post_graphql::<queries::ProjectToken, _>(&client, self.get_backboard(), vars)
-                .await?;
+            let data =
+                post_graphql::<queries::ProjectToken, _>(&client, self.get_backboard(), vars)
+                    .await?;
 
-            let data = res.data.context("Invalid project token!")?;
-
-            let project = RailwayProject {
+            let project = LinkedProject {
                 project_path: self.get_current_directory()?,
                 name: Some(data.project_token.project.name),
                 project: data.project_token.project.id,
                 environment: data.project_token.environment.id,
                 environment_name: Some(data.project_token.environment.name),
-                service: None,
+                service: project.cloned().and_then(|p| p.service),
             };
             return Ok(project);
         }
-        let path = self.get_closest_linked_project_directory()?;
-        let project = self
-            .root_config
-            .projects
-            .get(&path)
-            .context("Project not found! Run `railway link` to link to a project")?;
-        Ok(project.clone())
+
+        project
+            .cloned()
+            .ok_or_else(|| RailwayError::NoLinkedProject.into())
     }
 
-    pub fn get_linked_project_mut(&mut self) -> Result<&mut RailwayProject> {
+    pub fn get_linked_project_mut(&mut self) -> Result<&mut LinkedProject> {
         let path = self.get_closest_linked_project_directory()?;
-        let project = self
-            .root_config
-            .projects
-            .get_mut(&path)
-            .context("Project not found! Run `railway link` to link to a project")?;
-        Ok(project)
+        let project = self.root_config.projects.get_mut(&path);
+
+        project.ok_or_else(|| RailwayError::ProjectNotFound.into())
     }
 
     pub fn link_project(
@@ -215,7 +231,7 @@ impl Configs {
         environment_name: Option<String>,
     ) -> Result<()> {
         let path = self.get_current_directory()?;
-        let project = RailwayProject {
+        let project = LinkedProject {
             project_path: path.clone(),
             name,
             project: project_id,
@@ -223,6 +239,7 @@ impl Configs {
             environment_name,
             service: None,
         };
+
         self.root_config.projects.insert(path, project);
         Ok(())
     }
@@ -233,14 +250,10 @@ impl Configs {
         Ok(())
     }
 
-    pub fn unlink_project(&mut self) -> Result<RailwayProject> {
-        let path = self.get_closest_linked_project_directory()?;
-        let project = self
-            .root_config
-            .projects
-            .remove(&path)
-            .context("Project not found! Run `railway link` to link to a project")?;
-        Ok(project)
+    pub fn unlink_project(&mut self) {
+        if let Ok(path) = self.get_closest_linked_project_directory() {
+            self.root_config.projects.remove(&path);
+        }
     }
 
     pub fn unlink_service(&mut self) -> Result<()> {
@@ -249,7 +262,7 @@ impl Configs {
         Ok(())
     }
 
-    pub fn get_render_config() -> RenderConfig {
+    pub fn get_render_config() -> RenderConfig<'static> {
         RenderConfig::default_colored()
             .with_help_message(
                 StyleSheet::new()
@@ -267,6 +280,9 @@ impl Configs {
                         .with_fg(inquire::ui::Color::LightCyan)
                         .with_attr(Attributes::BOLD),
                 ),
+            )
+            .with_canceled_prompt_indicator(
+                Styled::new("<cancelled>").with_fg(inquire::ui::Color::DarkRed),
             )
     }
 

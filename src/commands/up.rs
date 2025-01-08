@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::bail;
+
 use futures::StreamExt;
 use gzp::{deflate::Gzip, ZBuilder};
 use ignore::WalkBuilder;
@@ -17,8 +18,18 @@ use tar::Builder;
 
 use crate::{
     consts::TICK_STRING,
+    controllers::{
+        deployment::{stream_build_logs, stream_deploy_logs},
+        environment::get_matched_environment,
+        project::{ensure_project_and_environment_exist, get_project},
+    },
+    errors::RailwayError,
     subscription::subscribe_graphql,
-    util::prompt::{prompt_select, PromptService},
+    subscriptions::deployment::DeploymentStatus,
+    util::{
+        logs::format_attr_log,
+        prompt::{prompt_select, PromptService},
+    },
 };
 
 use super::*;
@@ -33,8 +44,38 @@ pub struct Args {
     detach: bool,
 
     #[clap(short, long)]
+    /// Stream build logs only, then exit (equivalent to setting $CI=true).
+    ci: bool,
+
+    #[clap(short, long)]
     /// Service to deploy to (defaults to linked service)
     service: Option<String>,
+
+    #[clap(short, long)]
+    /// Environment to deploy to (defaults to linked environment)
+    environment: Option<String>,
+
+    #[clap(long)]
+    /// Don't ignore paths from .gitignore
+    no_gitignore: bool,
+
+    #[clap(long)]
+    /// Verbose output
+    verbose: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpResponse {
+    pub deployment_id: String,
+    pub url: String,
+    pub logs_url: String,
+    pub deployment_domain: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpErrorResponse {
+    pub message: String,
 }
 
 pub async fn get_service_to_deploy(
@@ -43,14 +84,10 @@ pub async fn get_service_to_deploy(
     service_arg: Option<String>,
 ) -> Result<Option<String>> {
     let linked_project = configs.get_linked_project().await?;
+    let project = get_project(client, configs, linked_project.project.clone()).await?;
+    let services = project.services.edges.iter().collect::<Vec<_>>();
 
-    let vars = queries::project::Variables {
-        id: linked_project.project.to_owned(),
-    };
-    let res = post_graphql::<queries::Project, _>(client, configs.get_backboard(), vars).await?;
-    let body = res.data.context("Failed to get project (query project)")?;
-
-    let services = body.project.services.edges.iter().collect::<Vec<_>>();
+    ensure_project_and_environment_exist(client, configs, &linked_project).await?;
 
     let service = if let Some(service_arg) = service_arg {
         // If the user specified a service, use that
@@ -71,18 +108,16 @@ pub async fn get_service_to_deploy(
         if services.is_empty() {
             // If there are no services, backboard will generate one for us
             None
-        } else if services.len() == 1 {
-            // If there is only one service, use that
-            services.first().map(|service| service.node.id.to_owned())
         } else {
             // If there are multiple services, prompt the user to select one
             if std::io::stdout().is_terminal() {
                 let prompt_services: Vec<_> =
                     services.iter().map(|s| PromptService(&s.node)).collect();
-                let service = prompt_select("Select a service to deploy to", prompt_services)?;
+                let service = prompt_select("Select a service to deploy to", prompt_services)
+                    .context("Please specify a service to deploy to via the `--service` flag.")?;
                 Some(service.0.id.clone())
             } else {
-                bail!("Multiple services found. Please specify a service to deploy to.")
+                bail!("Multiple services found. Please specify a service to deploy to via the `--service` flag.")
             }
         }
     };
@@ -101,6 +136,14 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
         None => prefix.clone(),
     };
 
+    let project = get_project(&client, &configs, linked_project.project.clone()).await?;
+
+    let environment = args
+        .environment
+        .clone()
+        .unwrap_or(linked_project.environment.clone());
+    let environment_id = get_matched_environment(&project, environment)?.id;
+
     let service = get_service_to_deploy(&configs, &client, args.service).await?;
 
     let spinner = if std::io::stdout().is_terminal() {
@@ -117,16 +160,42 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
         println!("Indexing...");
         None
     };
+
+    // Explanation for the below block
+    // arc is a reference counted pointer to a mutexed vector of bytes, which
+    // stores the actual tarball in memory.
+    //
+    // parz is a parallelized gzip writer, which writes to the arc (still in memory)
+    //
+    // archive is a tar archive builder, which writes to the parz writer `new(&mut parz)
+    //
+    // builder is a directory walker which returns an iterable that we loop over to add
+    // files to the tarball (archive)
+    //
+    // during the iteration of `builder`, we ignore all files that match the patterns found in
+    // .railwayignore
+    // .gitignore
+    // .git/**
+    // node_modules/**
     let bytes = Vec::<u8>::new();
     let arc = Arc::new(Mutex::new(bytes));
     let mut parz = ZBuilder::<Gzip, _>::new()
         .num_threads(num_cpus::get())
         .from_writer(SynchronizedWriter::new(arc.clone()));
+
+    // list of all paths to ignore by default
+    let ignore_paths = [".git", "node_modules"];
+    let ignore_paths: Vec<&std::ffi::OsStr> =
+        ignore_paths.iter().map(std::ffi::OsStr::new).collect();
+
     {
         let mut archive = Builder::new(&mut parz);
         let mut builder = WalkBuilder::new(path);
         builder.add_custom_ignore_filename(".railwayignore");
-        builder.add_custom_ignore_filename(".gitignore");
+        if !args.no_gitignore {
+            builder.add_custom_ignore_filename(".gitignore");
+        }
+
         let walker = builder.follow_links(true).hidden(false);
         let walked = walker.build().collect::<Vec<_>>();
         if let Some(spinner) = spinner {
@@ -147,6 +216,12 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
             for entry in walked.into_iter().progress_with(pg) {
                 let entry = entry?;
                 let path = entry.path();
+                if path
+                    .components()
+                    .any(|c| ignore_paths.contains(&c.as_os_str()))
+                {
+                    continue;
+                }
                 let stripped = PathBuf::from(".").join(path.strip_prefix(&prefix)?);
                 archive.append_path_with_name(path, stripped)?;
             }
@@ -154,6 +229,12 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
             for entry in walked.into_iter() {
                 let entry = entry?;
                 let path = entry.path();
+                if path
+                    .components()
+                    .any(|c| ignore_paths.contains(&c.as_os_str()))
+                {
+                    continue;
+                }
                 let stripped = PathBuf::from(".").join(path.strip_prefix(&prefix)?);
                 archive.append_path_with_name(path, stripped)?;
             }
@@ -161,12 +242,23 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
     }
     parz.finish()?;
 
-    let builder = client.post(format!(
+    let url = format!(
         "https://backboard.{hostname}/project/{}/environment/{}/up?serviceId={}",
         linked_project.project,
-        linked_project.environment,
-        service.unwrap_or_default(),
-    ));
+        environment_id,
+        service.clone().unwrap_or_default(),
+    );
+
+    if args.verbose {
+        let bytes_len = arc.lock().unwrap().len();
+        println!("railway up");
+        println!("service: {}", service.clone().unwrap_or_default());
+        println!("environment: {}", environment_id);
+        println!("bytes: {}", bytes_len);
+        println!("url: {}", url);
+    }
+
+    let builder = client.post(url);
     let spinner = if std::io::stdout().is_terminal() {
         let spinner = ProgressBar::new_spinner()
             .with_style(
@@ -183,66 +275,136 @@ pub async fn command(args: Args, _json: bool) -> Result<()> {
     };
 
     let body = arc.lock().unwrap().clone();
+
     let res = builder
         .header("Content-Type", "multipart/form-data")
         .body(body)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    let status = res.status();
+    if status != 200 {
+        if let Some(spinner) = spinner {
+            spinner.finish_with_message("Failed");
+        }
+
+        // If a user error, parse the response
+        if status == 400 {
+            let body = res.json::<UpErrorResponse>().await?;
+            return Err(RailwayError::FailedToUpload(body.message).into());
+        }
+
+        if status == 413 {
+            let filesize = arc.lock().unwrap().len();
+            return Err(RailwayError::FailedToUpload(format!(
+                "Failed to upload code. File too large ({} bytes)",
+                filesize
+            )))?;
+        }
+
+        return Err(RailwayError::FailedToUpload(format!(
+            "Failed to upload code with status code {status}"
+        ))
+        .into());
+    }
 
     let body = res.json::<UpResponse>().await?;
     if let Some(spinner) = spinner {
         spinner.finish_with_message("Uploaded");
     }
+
+    let deployment_id = body.deployment_id;
+
     println!("  {}: {}", "Build Logs".green().bold(), body.logs_url);
+
     if args.detach {
         return Ok(());
     }
 
-    // If the user is not in a terminal, don't stream logs
-    if !std::io::stdout().is_terminal() {
+    let ci_mode = Configs::env_is_ci() || args.ci;
+    if ci_mode {
+        println!("{}", "CI mode enabled".green().bold());
+    }
+
+    // If the user is not in a terminal AND if we are not in CI mode, don't stream logs
+    if !std::io::stdout().is_terminal() && !ci_mode {
         return Ok(());
     }
 
-    let vars = queries::deployments::Variables {
-        project_id: linked_project.project.clone(),
-    };
+    //	Create vector of log streaming tasks
+    //	Always stream build logs
+    let build_deployment_id = deployment_id.clone();
+    let mut tasks = vec![tokio::task::spawn(async move {
+        if let Err(e) = stream_build_logs(build_deployment_id, |log| {
+            println!("{}", log.message);
+            if args.ci && log.message.starts_with("No changed files matched patterns") {
+                std::process::exit(0);
+            }
+        })
+        .await
+        {
+            eprintln!("Failed to stream build logs: {}", e);
 
-    let res =
-        post_graphql::<queries::Deployments, _>(&client, configs.get_backboard(), vars).await?;
-
-    let body = res.data.context("Failed to retrieve response body")?;
-
-    let mut deployments: Vec<_> = body
-        .project
-        .deployments
-        .edges
-        .into_iter()
-        .map(|deployment| deployment.node)
-        .collect();
-    deployments.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let latest_deployment = deployments.first().context("No deployments found")?;
-    let vars = subscriptions::build_logs::Variables {
-        deployment_id: latest_deployment.id.clone(),
-        filter: Some(String::new()),
-        limit: Some(500),
-    };
-
-    let (_client, mut log_stream) = subscribe_graphql::<subscriptions::BuildLogs>(vars).await?;
-    while let Some(Ok(log)) = log_stream.next().await {
-        let log = log.data.context("Failed to retrieve log")?;
-        for line in log.build_logs {
-            println!("{}", line.message);
+            if ci_mode {
+                std::process::exit(1);
+            }
         }
+    })];
+
+    // Stream deploy logs only if is not in ci mode
+    if !ci_mode {
+        let deploy_deployment_id = deployment_id.clone();
+        tasks.push(tokio::task::spawn(async move {
+            if let Err(e) = stream_deploy_logs(deploy_deployment_id, format_attr_log).await {
+                eprintln!("Failed to stream deploy logs: {}", e);
+            }
+        }));
     }
 
-    Ok(())
-}
+    let mut stream =
+        subscribe_graphql::<subscriptions::Deployment>(subscriptions::deployment::Variables {
+            id: deployment_id.clone(),
+        })
+        .await?;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpResponse {
-    pub url: String,
-    pub logs_url: String,
-    pub deployment_domain: String,
+    tokio::task::spawn(async move {
+        while let Some(Ok(res)) = stream.next().await {
+            if let Some(errors) = res.errors {
+                eprintln!(
+                    "Failed to get deploy status: {}",
+                    errors
+                        .iter()
+                        .map(|err| err.to_string())
+                        .collect::<Vec<String>>()
+                        .join("; ")
+                );
+                if ci_mode {
+                    std::process::exit(1);
+                }
+            }
+            if let Some(data) = res.data {
+                match data.deployment.status {
+                    DeploymentStatus::SUCCESS => {
+                        println!("{}", "Deploy complete".green().bold());
+                        if ci_mode {
+                            std::process::exit(0);
+                        }
+                    }
+                    DeploymentStatus::FAILED => {
+                        println!("{}", "Deploy failed".red().bold());
+                        std::process::exit(1);
+                    }
+                    DeploymentStatus::CRASHED => {
+                        println!("{}", "Deploy crashed".red().bold());
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    futures::future::join_all(tasks).await;
+
+    Ok(())
 }

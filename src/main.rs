@@ -8,6 +8,7 @@ mod client;
 mod config;
 mod consts;
 mod controllers;
+mod errors;
 mod gql;
 mod subscription;
 mod table;
@@ -35,10 +36,11 @@ commands_enum!(
     add,
     completion,
     connect,
-    delete,
+    deploy,
     domain,
     docs,
-    environment,
+    down,
+    environment(env),
     init,
     link,
     list,
@@ -54,14 +56,29 @@ commands_enum!(
     unlink,
     up,
     variables,
-    whoami
+    whoami,
+    volume,
+    redeploy
 );
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Args::parse();
 
-    Commands::exec(cli).await?;
+    match Commands::exec(cli).await {
+        Ok(_) => {}
+        Err(e) => {
+            // If the user cancels the operation, we want to exit successfully
+            // This can happen if Ctrl+C is pressed during a prompt
+            if e.root_cause().to_string() == inquire::InquireError::OperationInterrupted.to_string()
+            {
+                return Ok(());
+            }
+
+            eprintln!("{:?}", e);
+            std::process::exit(1);
+        }
+    }
 
     Ok(())
 }

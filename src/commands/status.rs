@@ -1,26 +1,24 @@
+use crate::controllers::project::{ensure_project_and_environment_exist, get_project};
+
 use super::*;
 
 /// Show information about the current project
 #[derive(Parser)]
-pub struct Args {}
+pub struct Args;
 
 pub async fn command(_args: Args, json: bool) -> Result<()> {
     let configs = Configs::new()?;
     let client = GQLClient::new_authorized(&configs)?;
     let linked_project = configs.get_linked_project().await?;
+    let project = get_project(&client, &configs, linked_project.project.to_owned()).await?;
 
-    let vars = queries::project::Variables {
-        id: linked_project.project.to_owned(),
-    };
+    ensure_project_and_environment_exist(&client, &configs, &linked_project).await?;
 
-    let res = post_graphql::<queries::Project, _>(&client, configs.get_backboard(), vars).await?;
-
-    let body = res.data.context("Failed to retrieve response body")?;
     if !json {
-        println!("Project: {}", body.project.name.purple().bold());
+        println!("Project: {}", project.name.purple().bold());
         println!(
             "Environment: {}",
-            body.project
+            project
                 .environments
                 .edges
                 .iter()
@@ -31,26 +29,20 @@ pub async fn command(_args: Args, json: bool) -> Result<()> {
                 .blue()
                 .bold()
         );
-        if !body.project.plugins.edges.is_empty() {
-            println!("Plugins:");
-            for plugin in body.project.plugins.edges.iter().map(|plugin| &plugin.node) {
-                println!("{}", format!("{:?}", plugin.name).dimmed().bold());
-            }
-        }
-        if !body.project.services.edges.is_empty() {
-            println!("Services:");
-            for service in body
-                .project
+
+        if let Some(linked_service) = linked_project.service {
+            let service = project
                 .services
                 .edges
                 .iter()
-                .map(|service| &service.node)
-            {
-                println!("{}", service.name.dimmed().bold());
-            }
+                .find(|service| service.node.id == linked_service)
+                .expect("the linked service doesn't exist");
+            println!("Service: {}", service.node.name.green().bold());
+        } else {
+            println!("Service: {}", "None".red().bold())
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(&body.project)?);
+        println!("{}", serde_json::to_string_pretty(&project)?);
     }
     Ok(())
 }

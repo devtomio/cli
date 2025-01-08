@@ -1,10 +1,5 @@
-use anyhow::bail;
-use is_terminal::IsTerminal;
-
 use crate::{
-    consts::{ABORTED_BY_USER, NON_INTERACTIVE_FAILURE},
-    interact_or,
-    util::prompt::prompt_confirm_with_default,
+    consts::NON_INTERACTIVE_FAILURE, interact_or, util::prompt::prompt_confirm_with_default,
 };
 
 use super::*;
@@ -19,9 +14,9 @@ pub async fn command(_args: Args, _json: bool) -> Result<()> {
     let confirm = prompt_confirm_with_default("Open the browser?", true)?;
 
     if !confirm {
-        bail!(ABORTED_BY_USER);
+        return Ok(());
     }
 
-    ::open::that("https://docs.railway.app/")?;
+    ::open::that("https://docs.railway.com")?;
     Ok(())
 }

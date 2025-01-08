@@ -8,7 +8,7 @@ env:
 
 jobs:
   create-release:
-    name: Create Release
+    name: Create Draft Release
     runs-on: ubuntu-latest
     outputs:
       railway_version: ${{ env.CLI_VERSION }}
@@ -25,32 +25,33 @@ jobs:
           echo "version is: ${{ env.CLI_VERSION }}"
 
       - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 1
+        uses: actions/checkout@v4
 
       - name: Build Changelog
         id: build_changelog
-        uses: mikepenz/release-changelog-builder-action@v3.7.0
+        uses: mikepenz/release-changelog-builder-action@v5
         with:
           configuration: ".github/changelog-configuration.json"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create GitHub release
-        id: release
-        uses: softprops/action-gh-release@v1
+      - name: Create Draft GitHub release
+        id: create_release
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ env.CLI_VERSION }}
-          name: ${{ env.CLI_VERSION }}
+          draft: true
+          prerelease: false
+          body: ${{steps.build_changelog.outputs.changelog}}
 
   build-release:
     name: Build Release Assets
     needs: ["create-release"]
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    env:
+        RUSTFLAGS: ${{ matrix.rustflags || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +61,7 @@ jobs:
 
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            docker-artifact: true
 
           - target: i686-unknown-linux-musl
             os: ubuntu-latest
@@ -85,23 +87,23 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
 
-          - target: i686-pc-windows-gnu
+          - target: aarch64-pc-windows-msvc
             os: windows-latest
+            rustflags: -C target-feature=+crt-static
+
+          - target: i686-pc-windows-gnu
+            os: ubuntu-latest
             use-cross: true
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          profile: minimal
-          override: true
+          targets: ${{ matrix.target }}
 
       - name: Build release binary
         uses: actions-rs/cargo@v1
@@ -109,6 +111,24 @@ jobs:
           command: build
           args: --release --locked --target ${{ matrix.target }}
           use-cross: ${{ matrix.use-cross || matrix.os == 'ubuntu-latest' }}
+
+      - name: Upload docker artifact
+        if: ${{ matrix.docker-artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-binary-artifact-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
+
+      - name: Store docker artifact version
+        if: ${{ matrix.docker-artifact }}
+        run: echo "${{ needs.create-release.outputs.railway_version }}" >> cli-version.txt
+
+      - name: Upload docker artifact version
+        if: ${{ matrix.docker-artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-tag-artifact
+          path: cli-version.txt
 
       - name: Prepare binaries (zip) [Windows]
         if: matrix.os == 'windows-latest'
@@ -119,7 +139,7 @@ jobs:
           cd -
 
       - name: Prepare binaries (tar) [Windows]
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-latest' || matrix.target == 'i686-pc-windows-gnu'
         run: |
           cd target/${{ matrix.target }}/release
           strip railway.exe
@@ -128,20 +148,24 @@ jobs:
           cd -
 
       - name: Prepare binaries [-linux]
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-latest' && matrix.target != 'i686-pc-windows-gnu'
         run: |
           cd target/${{ matrix.target }}/release
           strip railway || true
           tar czvf ../../../railway-${{ needs.create-release.outputs.railway_version }}-${{ matrix.target }}.tar.gz railway
           cd -
 
-      - name: Upload release archive
-        uses: softprops/action-gh-release@v1
+      - name: Upload release asset
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.create-release.outputs.railway_version }}
-          files: railway-${{ needs.create-release.outputs.railway_version }}-${{ matrix.target }}*
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          gh release upload "${{ needs.create-release.outputs.railway_version }}" railway-${{ needs.create-release.outputs.railway_version }}-${{ matrix.target }}*
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cargo-deb
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -153,18 +177,68 @@ jobs:
 
       - name: Upload .deb package file
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: svenstaro/upload-release-action@v2
-        with:
-          tag: ${{ needs.create-release.outputs.railway_version }}
-          file: railway-${{ needs.create-release.outputs.railway_version }}-amd64.deb
-
-      - name: Update homebrew tap
-        uses: mislav/bump-homebrew-formula-action@v2
-        if: "matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin' && !contains(github.ref, '-')"
-        with:
-          formula-name: rlwy
-          formula-path: rlwy.rb
-          homebrew-tap: railwayapp/homebrew-tap
-          download-url: https://github.com/railwayapp/cli/releases/latest/download/railway-${{ needs.create-release.outputs.railway_version }}-${{ matrix.target }}.tar.gz
         env:
-          COMMITTER_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ needs.create-release.outputs.railway_version }}" "railway-${{ needs.create-release.outputs.railway_version }}-amd64.deb"
+
+  publish-release:
+    name: Publish Release
+    needs: ["create-release", "build-release"]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${{ needs.create-release.outputs.railway_version }}" --draft=false
+
+  publish-npm:
+    name: Publish NPM
+    needs: ["create-release", "build-release", "publish-release"]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v1
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+
+      - name: Setup Git user
+        run: |
+          git config --global user.name "Github Bot"
+          git config --global user.email "github-bot@railway.app"
+
+      - name: Create .npmrc file
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: NPM publish
+        run: npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  notify-release:
+    name: Notify Release
+    needs: ["create-release", "build-release", "publish-release"]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Discord Deployment Status Notification
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DEPLOY_WEBHOOK }}
+          status: ${{ job.status }}
+          title: "Published CLI"
+          description: "Published CLI version ${{ needs.create-release.outputs.railway_version }}"
+          nofail: false
+          nodetail: false
+          username: Github Actions
+          avatar_url: https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png
